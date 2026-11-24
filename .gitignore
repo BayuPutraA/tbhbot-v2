@@ -35,3 +35,4 @@ config.json
 
 # User logs & temporary state
 *.log
+synth_log.json

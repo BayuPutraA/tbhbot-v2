@@ -1004,7 +1004,7 @@ class SynthesisManager:
             self.set_status("Auto-Fill Synth Complete")
 
             if hasattr(self.engine, "telegram") and self.engine.telegram:
-                self.engine.telegram.notify_synthesis("AutoFill", 9, tier="80_90")
+                self.engine.telegram.notify_synthesis("AutoFill", 9, tier="80~90")
 
             return True
         except Exception as e:

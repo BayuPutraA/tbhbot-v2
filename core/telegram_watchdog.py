@@ -404,15 +404,24 @@ class TelegramWatchdog:
         # Anti-clutter message IDs
         self.last_dashboard_msg_id: Optional[int] = None
         self.last_photo_msg_id: Optional[int] = None
+        self.last_synth_log_msg_id: Optional[int] = None
+
+        # Rolling synthesis log persistence
+        self._synth_log_lock = threading.RLock()
+        self.synth_log_path = "synth_log.json"
+        self.synth_log_max_visible = 15
+        self.synth_log_entries: List[Dict[str, Any]] = []
 
         # Live Session Tracking
         self.session_stats: Dict[str, Any] = {
             "start_time": time.time(),
             "cycles_completed": 0,
-            "syntheses": {"Common": 0, "Uncommon": 0, "Rare": 0, "total": 0},
+            "syntheses": {"Common": 0, "Uncommon": 0, "Rare": 0, "Legendary": 0, "AutoFill": 0, "total": 0},
             "lvl50_stashed": 0,
             "stuck_incidents": 0,
         }
+
+        self._load_synth_log()
 
     def reload_config(self, full_config: Dict[str, Any]):
         """Reloads settings from latest config dict and updates client."""
@@ -493,6 +502,18 @@ class TelegramWatchdog:
                 self.client.delete_message(target_mid)
             except Exception:
                 pass
+            if self.last_photo_msg_id == target_mid:
+                self.last_photo_msg_id = None
+            if self.last_dashboard_msg_id == target_mid:
+                self.last_dashboard_msg_id = None
+
+        # Avoid leaving an older dashboard orphaned behind a photo->menu transition
+        if self.last_dashboard_msg_id and self.last_dashboard_msg_id != target_mid:
+            try:
+                self.client.delete_message(self.last_dashboard_msg_id)
+            except Exception:
+                pass
+            self.last_dashboard_msg_id = None
 
         # Send fresh dashboard and record ID
         res = self.client.send_message(text, reply_markup=reply_markup)
@@ -565,34 +586,175 @@ class TelegramWatchdog:
         """Called when stuck watchdog triggers."""
         self.session_stats["stuck_incidents"] = self.session_stats.get("stuck_incidents", 0) + 1
 
+    def _load_synth_log(self):
+        """Loads persisted rolling synthesis log message ID and entries from disk."""
+        with self._synth_log_lock:
+            if not os.path.isfile(self.synth_log_path):
+                return
+            try:
+                with open(self.synth_log_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    mid = data.get("message_id")
+                    self.last_synth_log_msg_id = int(mid) if mid else None
+                    entries = data.get("entries", [])
+                    if isinstance(entries, list):
+                        self.synth_log_entries = [e for e in entries if isinstance(e, dict)][-200:]
+            except Exception:
+                pass
+
+    def _save_synth_log(self):
+        """Persists rolling synthesis log message ID and entries safely to disk."""
+        with self._synth_log_lock:
+            payload = {
+                "message_id": self.last_synth_log_msg_id,
+                "entries": self.synth_log_entries[-200:],
+            }
+            try:
+                with open(self.synth_log_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _normalize_tier(tier: str) -> str:
+        t = str(tier or "50").strip()
+        if t.lower().startswith("lv."):
+            t = t[3:].strip()
+        if t == "80_90":
+            return "80~90"
+        if t in ("65_80", "65"):
+            return "65~80"
+        return t
+
+    def _build_synth_log_text(self) -> str:
+        icons = {
+            "Common": "⚪",
+            "Uncommon": "🟢",
+            "Rare": "🔵",
+            "Legendary": "🟠",
+            "Immortal": "🔴",
+            "AutoFill": "⚡",
+        }
+        with self._synth_log_lock:
+            total = len(self.synth_log_entries)
+            if total == 0:
+                return "⚗️ <b>Synthesis Log</b>\n<i>No syntheses recorded yet.</i>"
+
+            visible = self.synth_log_entries[-self.synth_log_max_visible:]
+            hidden = total - len(visible)
+            lines = [f"⚗️ <b>Synthesis Log</b> ({total} total)"]
+            if hidden > 0:
+                lines.append(f"<i>… +{hidden} earlier</i>")
+            for entry in visible:
+                ts = entry.get("time", "--:--")
+                tier = self._normalize_tier(entry.get("tier", "50"))
+                rarity = entry.get("rarity", "Unknown")
+                icon = icons.get(rarity, "🔹")
+                lines.append(f"<code>{ts}</code> • Lv.{tier} {icon} {rarity}")
+            return "\n".join(lines)
+
+    def get_synth_log_inline_keyboard(self) -> Dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 Refresh", "callback_data": "cmd_refresh_synth_log"},
+                    {"text": "🗑️ Clear Log", "callback_data": "cmd_clear_synth_log"},
+                ]
+            ]
+        }
+
+    def send_or_edit_synth_log(self, edit_msg_id: Optional[int] = None):
+        """Sends or updates the dedicated rolling synthesis log message in-place."""
+        if not self.enabled or not self.client.is_configured:
+            return
+
+        with self._synth_log_lock:
+            text = self._build_synth_log_text()
+            keyboard = self.get_synth_log_inline_keyboard()
+            target_mid = edit_msg_id or self.last_synth_log_msg_id
+
+            if target_mid:
+                ok, _ = self.client.edit_message_text(text, message_id=target_mid, reply_markup=keyboard)
+                if ok:
+                    if self.last_synth_log_msg_id != target_mid:
+                        self.last_synth_log_msg_id = target_mid
+                        self._save_synth_log()
+                    return
+                try:
+                    self.client.delete_message(target_mid)
+                except Exception:
+                    pass
+                if self.last_synth_log_msg_id == target_mid:
+                    self.last_synth_log_msg_id = None
+
+            if self.last_synth_log_msg_id and self.last_synth_log_msg_id != target_mid:
+                try:
+                    self.client.delete_message(self.last_synth_log_msg_id)
+                except Exception:
+                    pass
+                self.last_synth_log_msg_id = None
+
+            res = self.client.send_message(text, reply_markup=keyboard)
+            if getattr(res, "message_id", None):
+                self.last_synth_log_msg_id = res.message_id
+            self._save_synth_log()
+
+    def _clear_synth_log_action(self, edit_msg_id: Optional[int] = None):
+        """Clears synthesis log history and deletes the Telegram log message (with >48h edit fallback)."""
+        with self._synth_log_lock:
+            self.synth_log_entries = []
+            target_mid = edit_msg_id or self.last_synth_log_msg_id
+            old_mid = self.last_synth_log_msg_id
+
+            deleted = True
+            if target_mid and self.enabled and self.client.is_configured:
+                deleted = bool(self.client.delete_message(target_mid))
+
+            if old_mid and old_mid != target_mid and self.enabled and self.client.is_configured:
+                try:
+                    self.client.delete_message(old_mid)
+                except Exception:
+                    pass
+
+            if deleted or not target_mid:
+                self.last_synth_log_msg_id = None
+            else:
+                ok, _ = self.client.edit_message_text(
+                    "⚗️ <b>Synthesis Log</b>\n<i>Log cleared.</i>",
+                    message_id=target_mid,
+                    reply_markup={"inline_keyboard": []},
+                )
+                if not ok:
+                    self.last_synth_log_msg_id = None
+
+            self._save_synth_log()
+
     def notify_synthesis(self, rarity: str, count: int, tier: str = "50"):
-        """Sends notification when a Cube synthesis occurs."""
-        syn = self.session_stats.setdefault("syntheses", {"Common": 0, "Uncommon": 0, "Rare": 0, "total": 0})
+        """Logs Cube synthesis into the single rolling Telegram synthesis log message."""
+        syn = self.session_stats.setdefault(
+            "syntheses",
+            {"Common": 0, "Uncommon": 0, "Rare": 0, "Legendary": 0, "AutoFill": 0, "total": 0},
+        )
         syn[rarity] = syn.get(rarity, 0) + 1
         syn["total"] = syn.get("total", 0) + 1
+
+        norm_tier = self._normalize_tier(tier)
+        with self._synth_log_lock:
+            self.synth_log_entries.append({
+                "time": time.strftime("%H:%M"),
+                "tier": norm_tier,
+                "rarity": rarity,
+                "count": int(count),
+            })
+            if len(self.synth_log_entries) > 200:
+                self.synth_log_entries = self.synth_log_entries[-200:]
+            self._save_synth_log()
 
         if not self.enabled or not self.notify_on_synth or not self.client.is_configured:
             return
 
-        msg = (
-            f"⚗ <b>[CUBE SYNTHESIS COMPLETE]</b>\n"
-            f"• <b>Tier:</b> Lv.{tier}\n"
-            f"• <b>Rarity:</b> {rarity}\n"
-            f"• <b>Items Loaded:</b> {count}/9\n"
-            f"• <b>Time:</b> {time.strftime('%H:%M:%S')}"
-        )
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "📊 Session Stats", "callback_data": "screen_stats"},
-                    {"text": "🔙 Main Menu", "callback_data": "screen_main"}
-                ],
-                [
-                    {"text": "🗑️ Dismiss Alert", "callback_data": "cmd_dismiss_dashboard"}
-                ]
-            ]
-        }
-        self.send_or_edit_dashboard(msg, reply_markup=keyboard)
+        self.send_or_edit_synth_log()
 
     # ---------------------------------------------------------
     # Screen Text Builders & Keyboards
@@ -656,6 +818,7 @@ class TelegramWatchdog:
                     {"text": "▶ Run Now", "callback_data": "cmd_run_now"}
                 ],
                 [
+                    {"text": "📜 Synth Log", "callback_data": "cmd_open_synth_log"},
                     {"text": "🗑️ Close Dashboard", "callback_data": "cmd_dismiss_dashboard"}
                 ]
             ]
@@ -671,6 +834,8 @@ class TelegramWatchdog:
         c_cnt = syn.get("Common", 0)
         u_cnt = syn.get("Uncommon", 0)
         r_cnt = syn.get("Rare", 0)
+        l_cnt = syn.get("Legendary", 0)
+        af_cnt = syn.get("AutoFill", 0)
         tot_syn = syn.get("total", 0)
 
         cycles = self.session_stats.get("cycles_completed", 0)
@@ -687,6 +852,8 @@ class TelegramWatchdog:
             f"  • Common:    {c_cnt}\n"
             f"  • Uncommon:  {u_cnt}\n"
             f"  • Rare:      {r_cnt}\n"
+            f"  • Legendary: {l_cnt}\n"
+            f"  • AutoFill:  {af_cnt}\n"
             f"  • <b>Total Syntheses:</b> <b>{tot_syn}</b> (freed ~{tot_syn * 8} slots)\n\n"
             f"<i>Live tracking since application started.</i>"
         )
@@ -696,9 +863,10 @@ class TelegramWatchdog:
             "inline_keyboard": [
                 [
                     {"text": "🔄 Refresh Stats", "callback_data": "screen_stats"},
-                    {"text": "⏱ Timer & Loop", "callback_data": "screen_timer"}
+                    {"text": "📜 Synth Log", "callback_data": "cmd_open_synth_log"}
                 ],
                 [
+                    {"text": "⏱ Timer & Loop", "callback_data": "screen_timer"},
                     {"text": "🔙 Back to Main Menu", "callback_data": "screen_main"}
                 ]
             ]
@@ -1029,6 +1197,12 @@ class TelegramWatchdog:
         elif cmd in ("/dismiss", "/close"):
             self._dismiss_dashboard_action()
 
+        elif cmd in ("/synthlog", "/synth_log", "/slog"):
+            self.send_or_edit_synth_log()
+
+        elif cmd in ("/clearsynth", "/clear_synth", "/clearlog"):
+            self._clear_synth_log_action()
+
         elif cmd in ("/log", "/logs", "/verbosity"):
             parts = cmd_text.split()
             if len(parts) > 1:
@@ -1111,6 +1285,14 @@ class TelegramWatchdog:
             self._execute_autofill_synth_action(edit_msg_id=edit_msg_id)
         elif data == "cmd_toggle_lvl50":
             self._toggle_lvl50_action(edit_msg_id=edit_msg_id)
+
+        # 4b. Rolling Synthesis Log
+        elif data == "cmd_open_synth_log":
+            self.send_or_edit_synth_log(edit_msg_id=None)
+        elif data == "cmd_refresh_synth_log":
+            self.send_or_edit_synth_log(edit_msg_id=edit_msg_id)
+        elif data == "cmd_clear_synth_log":
+            self._clear_synth_log_action(edit_msg_id=edit_msg_id)
 
         # 5. Dismissals
         elif data == "cmd_dismiss_photo":
