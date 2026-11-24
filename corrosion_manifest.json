@@ -1,0 +1,92 @@
+[
+  {
+    "id": 1,
+    "name": "Goblin Hide",
+    "filename": "c_mat_1.png",
+    "enabled": true
+  },
+  {
+    "id": 2,
+    "name": "Minor Ruby",
+    "filename": "c_mat_2.png",
+    "enabled": true
+  },
+  {
+    "id": 3,
+    "name": "Slime Jelly",
+    "filename": "c_mat_3.png",
+    "enabled": true
+  },
+  {
+    "id": 4,
+    "name": "Minor Amethys",
+    "filename": "c_mat_4.png",
+    "enabled": true
+  },
+  {
+    "id": 5,
+    "name": "Poisonous Herb",
+    "filename": "c_mat_5.png",
+    "enabled": true
+  },
+  {
+    "id": 6,
+    "name": "Minor Sapphire",
+    "filename": "c_mat_6.png",
+    "enabled": true
+  },
+  {
+    "id": 7,
+    "name": "Wolf Fang",
+    "filename": "c_mat_7.png",
+    "enabled": true
+  },
+  {
+    "id": 8,
+    "name": "Spider Silk",
+    "filename": "c_mat_8.png",
+    "enabled": true
+  },
+  {
+    "id": 9,
+    "name": "Wood",
+    "filename": "c_mat_9.png",
+    "enabled": true
+  },
+  {
+    "id": 10,
+    "name": "Skeleton Bone",
+    "filename": "c_mat_10.png",
+    "enabled": true
+  },
+  {
+    "id": 11,
+    "name": "Corrosion Mat 11",
+    "filename": "c_mat_11.png",
+    "enabled": false
+  },
+  {
+    "id": 12,
+    "name": "Corrosion Mat 12",
+    "filename": "c_mat_12.png",
+    "enabled": false
+  },
+  {
+    "id": 13,
+    "name": "Corrosion Mat 13",
+    "filename": "c_mat_13.png",
+    "enabled": false
+  },
+  {
+    "id": 14,
+    "name": "Corrosion Mat 14",
+    "filename": "c_mat_14.png",
+    "enabled": false
+  },
+  {
+    "id": 15,
+    "name": "Corrosion Mat 15",
+    "filename": "c_mat_15.png",
+    "enabled": false
+  }
+]

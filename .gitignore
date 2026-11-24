@@ -1,0 +1,36 @@
+# Virtual Environment (Must never be copied between PCs)
+.venv/
+env/
+venv/
+ENV/
+
+# Python Bytecode and Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Temporary test / render files & debug images
+_test_*.py
+*.png_test
+calibrator_render_test.png
+calibrator_bottom_fixed.png
+debug_*.png
+current_*.png
+test_*.png
+sort_btn_inspect.png
+*.rar
+*.zip
+
+# Backup directory
+_backup_working/
+
+# IDE files
+.idea/
+.vscode/
+
+# Local machine configurations (screen resolutions / coordinates vary per machine)
+config.json
+
+# User logs & temporary state
+*.log

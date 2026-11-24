@@ -1,0 +1,247 @@
+{
+  "common": [
+    {
+      "id": "c-mat_1",
+      "name": "Minor Topaz",
+      "filename": "c-mat_1.png"
+    },
+    {
+      "id": "c-mat_2",
+      "name": "Minor Emerald",
+      "filename": "c-mat_2.png"
+    },
+    {
+      "id": "c-mat_3",
+      "name": "Stone",
+      "filename": "c-mat_3.png"
+    },
+    {
+      "id": "c-mat_4",
+      "name": "Copper Nugget",
+      "filename": "c-mat_4.png"
+    },
+    {
+      "id": "c-mat_5",
+      "name": "Lether",
+      "filename": "c-mat_5.png"
+    }
+  ],
+  "uncommon": [
+    {
+      "id": "u-mat_1",
+      "name": "Bronze Ingot",
+      "filename": "u-mat_1.png"
+    },
+    {
+      "id": "u-mat_2",
+      "name": "Coral Piece",
+      "filename": "u-mat_2.png"
+    },
+    {
+      "id": "u-mat_3",
+      "name": "Obsidian Shard",
+      "filename": "u-mat_3.png"
+    },
+    {
+      "id": "u-mat_4",
+      "name": "Amber Gem",
+      "filename": "u-mat_4.png"
+    },
+    {
+      "id": "u-mat_5",
+      "name": "Jade Stone",
+      "filename": "u-mat_5.png"
+    },
+    {
+      "id": "u-mat_6",
+      "name": "Iron Ingot",
+      "filename": "u-mat_6.png"
+    },
+    {
+      "id": "u-mat_7",
+      "name": "Uncommon Mat 7",
+      "filename": "u-mat_7.png"
+    },
+    {
+      "id": "u-mat_8",
+      "name": "Uncommon Mat 8",
+      "filename": "u-mat_8.png"
+    },
+    {
+      "id": "u-mat_9",
+      "name": "Uncommon Mat 9",
+      "filename": "u-mat_9.png"
+    },
+    {
+      "id": "u-mat_10",
+      "name": "Uncommon Mat 10",
+      "filename": "u-mat_10.png"
+    },
+    {
+      "id": "u-mat_11",
+      "name": "Uncommon Mat 11",
+      "filename": "u-mat_11.png"
+    }
+  ],
+  "rare": [
+    {
+      "id": "r-mat_1",
+      "name": "Ruby",
+      "filename": "r-mat_1.png"
+    },
+    {
+      "id": "r-mat_2",
+      "name": "Topaz",
+      "filename": "r-mat_2.png"
+    },
+    {
+      "id": "r-mat_3",
+      "name": "Amethyst",
+      "filename": "r-mat_3.png"
+    },
+    {
+      "id": "r-mat_4",
+      "name": "Silver Ingot",
+      "filename": "r-mat_4.png"
+    },
+    {
+      "id": "r-mat_5",
+      "name": "Emerald",
+      "filename": "r-mat_5.png"
+    },
+    {
+      "id": "r-mat_6",
+      "name": "Bat Wing Membrane",
+      "filename": "r-mat_6.png"
+    },
+    {
+      "id": "r-mat_7",
+      "name": "Ogre Blood",
+      "filename": "r-mat_7.png"
+    },
+    {
+      "id": "r-mat_8",
+      "name": "Mushroom Spore",
+      "filename": "r-mat_8.png"
+    },
+    {
+      "id": "r-mat_9",
+      "name": "Ancient Tree Sap",
+      "filename": "r-mat_9.png"
+    },
+    {
+      "id": "r-mat_10",
+      "name": "Gold Ingot",
+      "filename": "r-mat_10.png"
+    },
+    {
+      "id": "r-mat_11",
+      "name": "Rare Mat 11",
+      "filename": "r-mat_11.png"
+    }
+  ],
+  "legendary": [
+    {
+      "id": "l-mat_1",
+      "name": "Crystal Quartz",
+      "filename": "l-mat_1.png"
+    },
+    {
+      "id": "l-mat_2",
+      "name": "Pearl",
+      "filename": "l-mat_2.png"
+    },
+    {
+      "id": "l-mat_3",
+      "name": "Turquoise",
+      "filename": "l-mat_3.png"
+    },
+    {
+      "id": "l-mat_4",
+      "name": "Garnet",
+      "filename": "l-mat_4.png"
+    },
+    {
+      "id": "l-mat_5",
+      "name": "Skull",
+      "filename": "l-mat_5.png"
+    },
+    {
+      "id": "l-mat_6",
+      "name": "Harpy Feather",
+      "filename": "l-mat_6.png"
+    },
+    {
+      "id": "l-mat_7",
+      "name": "Mandrake Root",
+      "filename": "l-mat_7.png"
+    },
+    {
+      "id": "l-mat_8",
+      "name": "Nightshade Extract",
+      "filename": "l-mat_8.png"
+    },
+    {
+      "id": "l-mat_9",
+      "name": "Stardust Ingot",
+      "filename": "l-mat_9.png"
+    },
+    {
+      "id": "l-mat_10",
+      "name": "Void Iron",
+      "filename": "l-mat_10.png"
+    }
+  ],
+  "immortal": [
+    {
+      "id": "i-mat_1",
+      "name": "Black Pearl",
+      "filename": "i-mat_1.png"
+    },
+    {
+      "id": "i-mat_2",
+      "name": "Demon Blood",
+      "filename": "i-mat_2.png"
+    },
+    {
+      "id": "i-mat_3",
+      "name": "Bloodstone",
+      "filename": "i-mat_3.png"
+    },
+    {
+      "id": "i-mat_4",
+      "name": "Thunderstone",
+      "filename": "i-mat_4.png"
+    },
+    {
+      "id": "i-mat_5",
+      "name": "Diamond",
+      "filename": "i-mat_5.png"
+    },
+    {
+      "id": "i-mat_6",
+      "name": "Opal",
+      "filename": "i-mat_6.png"
+    },
+    {
+      "id": "i-mat_7",
+      "name": "Basilisk Scale",
+      "filename": "i-mat_7.png"
+    },
+    {
+      "id": "i-mat_8",
+      "name": "Wyvern Claw",
+      "filename": "i-mat_8.png"
+    },
+    {
+      "id": "i-mat_9",
+      "name": "Dice",
+      "filename": "i-mat_9.png"
+    },
+    {
+      "id": "i-mat_10",
+      "name": "Lapis Lazuli",
+      "filename": "i-mat_10.png"
+    }
+  ]
+}
