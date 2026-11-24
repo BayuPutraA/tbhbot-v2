@@ -169,6 +169,7 @@ class TemplateMatcher:
         self._template_cache: Dict[str, np.ndarray] = {}
         self._template_cache_gray: Dict[str, np.ndarray] = {}
         self._template_mtimes: Dict[str, float] = {}
+        self._peak_kernel = np.ones((5, 5), np.uint8)
 
         if not os.path.exists(self.assets_dir):
             os.makedirs(self.assets_dir, exist_ok=True)
@@ -352,7 +353,8 @@ class TemplateMatcher:
                 continue
 
             res = cv2.matchTemplate(hay_proc, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
-            loc = np.where(res >= threshold)
+            dilated = cv2.dilate(res, self._peak_kernel, borderType=cv2.BORDER_REPLICATE)
+            loc = np.where((res >= threshold) & (res == dilated))
             for pt in zip(*loc[::-1]):
                 score = float(res[pt[1], pt[0]])
                 all_raw_matches.append((pt[0], pt[1], tw, th, score))

@@ -6,6 +6,7 @@ performing high-speed multi-scale template matching across the inventory grid.
 
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from typing import Optional, List, Dict, Any, Tuple
@@ -32,6 +33,9 @@ class CorrosionDetector:
         self._corrosion_library: List[Dict[str, Any]] = []
         self._corrosion_mtimes: Dict[str, float] = {}
         self._manifest_cache: List[Dict[str, Any]] = []
+        self._peak_kernel = np.ones((5, 5), np.uint8)
+        self._max_workers = min(6, max(2, os.cpu_count() or 4))
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="corr_scan")
 
         if not os.path.exists(self.corrosion_dir):
             os.makedirs(self.corrosion_dir, exist_ok=True)
@@ -332,64 +336,75 @@ class CorrosionDetector:
 
         conf_threshold = threshold if threshold is not None else float(self.config.get("confidence_threshold", 0.68))
         color_threshold = float(self.config.get("corrosion_color_threshold", 0.65))
-        raw_candidates = []
         roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY) if len(roi_img.shape) == 3 else roi_img
 
-        # Multi-scale matching: 1.0x raw (exact user snip) and 0.8x scaled
-        for ref in self._corrosion_library:
-            scales = [
-                ("raw", ref["tmpl_raw"], ref["tmpl_raw_gray"], ref.get("color_prof_raw")),
-                ("scale_08", ref["tmpl_08"], ref["tmpl_08_gray"], ref.get("color_prof_08"))
-            ]
+        def _scan_ref_chunk(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            chunk_cands = []
+            for ref in refs:
+                scales = [
+                    ("raw", ref["tmpl_raw"], ref["tmpl_raw_gray"], ref.get("color_prof_raw")),
+                    ("scale_08", ref["tmpl_08"], ref["tmpl_08_gray"], ref.get("color_prof_08"))
+                ]
 
-            for s_name, tmpl, tmpl_gray, color_prof in scales:
-                th, tw = tmpl.shape[:2]
-                if th > roi_h or tw > roi_w:
-                    continue
-
-                res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-                loc = np.where(res >= conf_threshold)
-                for pt in zip(*loc[::-1]):
-                    px, py = pt[0], pt[1]
-                    score = float(res[py, px])
-
-                    # Skip clipped edge items
-                    if py < -4 or (py + th) > roi_h + 4:
+                for s_name, tmpl, tmpl_gray, color_prof in scales:
+                    th, tw = tmpl.shape[:2]
+                    if th > roi_h or tw > roi_w:
                         continue
 
-                    crop_y1 = max(0, py)
-                    crop_y2 = min(roi_h, py + th)
-                    crop_x1 = max(0, px)
-                    crop_x2 = min(roi_w, px + tw)
-                    slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
-                    tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
+                    res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                    dilated = cv2.dilate(res, self._peak_kernel, borderType=cv2.BORDER_REPLICATE)
+                    loc = np.where((res >= conf_threshold) & (res == dilated))
+                    for pt in zip(*loc[::-1]):
+                        px, py = int(pt[0]), int(pt[1])
+                        score = float(res[py, px])
 
-                    diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
-                    if diff > 55.0:
-                        continue
-
-                    # Strict Anti-Recolor Color Verification (separates same-shape items of different color)
-                    if color_prof is not None:
-                        color_score, hue_diff, chroma_dist = self.verify_color_similarity(slot_crop, color_prof)
-                        if color_score < color_threshold:
+                        # Skip clipped edge items
+                        if py < -4 or (py + th) > roi_h + 4:
                             continue
-                    else:
-                        color_score = 1.0
-                        hue_diff = 0.0
-                        chroma_dist = 0.0
 
-                    combined_score = 0.5 * score + 0.5 * color_score
+                        crop_y1 = max(0, py)
+                        crop_y2 = min(roi_h, py + th)
+                        crop_x1 = max(0, px)
+                        crop_x2 = min(roi_w, px + tw)
+                        slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
+                        tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
 
-                    raw_candidates.append({
-                        "x": px, "y": py, "w": tw, "h": th,
-                        "score": combined_score,
-                        "shape_score": score,
-                        "color_score": color_score,
-                        "hue_diff": hue_diff,
-                        "chroma_dist": chroma_dist,
-                        "scale": s_name,
-                        "ref": ref
-                    })
+                        diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
+                        if diff > 55.0:
+                            continue
+
+                        # Strict Anti-Recolor Color Verification (separates same-shape items of different color)
+                        if color_prof is not None:
+                            color_score, hue_diff, chroma_dist = self.verify_color_similarity(slot_crop, color_prof)
+                            if color_score < color_threshold:
+                                continue
+                        else:
+                            color_score = 1.0
+                            hue_diff = 0.0
+                            chroma_dist = 0.0
+
+                        combined_score = 0.5 * score + 0.5 * color_score
+
+                        chunk_cands.append({
+                            "x": px, "y": py, "w": tw, "h": th,
+                            "score": combined_score,
+                            "shape_score": score,
+                            "color_score": color_score,
+                            "hue_diff": hue_diff,
+                            "chroma_dist": chroma_dist,
+                            "scale": s_name,
+                            "ref": ref
+                        })
+            return chunk_cands
+
+        if len(self._corrosion_library) >= 12 and self._max_workers > 1:
+            chunk_size = max(1, (len(self._corrosion_library) + self._max_workers - 1) // self._max_workers)
+            chunks = [self._corrosion_library[i:i + chunk_size] for i in range(0, len(self._corrosion_library), chunk_size)]
+            raw_candidates = []
+            for chunk_cands in self._executor.map(_scan_ref_chunk, chunks):
+                raw_candidates.extend(chunk_cands)
+        else:
+            raw_candidates = _scan_ref_chunk(self._corrosion_library)
 
         if not raw_candidates:
             return []

@@ -47,15 +47,21 @@ class OverlayRenderer:
         iroi = inv_roi or self.gear_detector.get_inventory_roi()
         croi = chest_roi or self.config.get("rois", {}).get("chest_region", {"x": 300, "y": 450, "width": 120, "height": 120})
 
-        full_screen = ScreenCapture.capture_screen()
-        h_screen, w_screen = full_screen.shape[:2]
-
         ix, iy, iw, ih = iroi["x"], iroi["y"], iroi["width"], iroi["height"]
-        inv_crop = full_screen[max(0, iy):min(h_screen, iy + ih), max(0, ix):min(w_screen, ix + iw)].copy()
+        if mode == "full":
+            full_screen = ScreenCapture.capture_screen()
+            h_screen, w_screen = full_screen.shape[:2]
+            inv_crop = full_screen[max(0, iy):min(h_screen, iy + ih), max(0, ix):min(w_screen, ix + iw)].copy()
+        else:
+            full_screen = None
+            h_screen, w_screen = 0, 0
+            needs_inv = (mode != "chest") or show_materials or show_corrosion or show_lvl50
+            inv_crop = ScreenCapture.capture_screen(iroi) if needs_inv else None
 
         # 1. Gear Detection
         items = []
-        if (show_gears and mode != "chest" and mode != "materials" and mode != "corrosion") or mode == "inventory":
+        scan_gears = (show_gears and mode != "chest" and mode != "materials" and mode != "corrosion") or mode == "inventory"
+        if scan_gears:
             items = self.gear_detector.scan_visible_inventory(iroi, roi_img=inv_crop)
 
         # 2. Materials Detection
@@ -74,13 +80,20 @@ class OverlayRenderer:
             except Exception:
                 corrosion_items = []
 
-        # 4. Low Level (Lv. 50) Items Detection
+        # 4. Low Level (Lv. 50) Items Detection (reuse full gear scan when already run)
         lvl50_items = []
         if (show_lvl50 or mode == "lvl50"):
-            try:
-                lvl50_items = self.gear_detector.scan_visible_inventory(iroi, roi_img=inv_crop, level_filter="50")
-            except Exception:
-                lvl50_items = []
+            if scan_gears:
+                lvl50_items = [
+                    (itm if "name" in itm else {**itm, "name": itm.get("gear_name", "gear")})
+                    for itm in items
+                    if str(itm.get("level")) == "50" or str(itm.get("bracket")) == "50"
+                ]
+            else:
+                try:
+                    lvl50_items = self.gear_detector.scan_visible_inventory(iroi, roi_img=inv_crop, level_filter="50")
+                except Exception:
+                    lvl50_items = []
 
         chest_state = self.chest_detector.detect_chest_state(croi)
 
@@ -226,7 +239,10 @@ class OverlayRenderer:
 
         if mode == "chest":
             cx, cy, cw, ch = croi["x"], croi["y"], croi["width"], croi["height"]
-            crop = full_screen[max(0, cy):min(h_screen, cy + ch), max(0, cx):min(w_screen, cx + cw)].copy()
+            if full_screen is not None:
+                crop = full_screen[max(0, cy):min(h_screen, cy + ch), max(0, cx):min(w_screen, cx + cw)].copy()
+            else:
+                crop = ScreenCapture.capture_screen(croi)
             if chest_state.get("inv_full_found"):
                 c_col = (0, 0, 255)  # Red for Inven Full
             elif chest_state["chest_found"]:

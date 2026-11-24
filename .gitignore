@@ -11,6 +11,7 @@ __pycache__/
 *.pyd
 
 # Temporary test / render files & debug images
+scratch/
 _test_*.py
 *.png_test
 calibrator_render_test.png

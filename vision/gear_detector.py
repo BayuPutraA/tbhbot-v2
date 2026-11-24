@@ -8,6 +8,7 @@ Provides:
 - Scroll shift and inventory-at-bottom detection
 """
 import os
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from typing import Optional, List, Dict, Tuple, Any
@@ -32,6 +33,9 @@ class GearDetector:
         self._ref_gear_library: List[Dict[str, Any]] = []
         self._ref_gear_by_level: Dict[str, List[Dict[str, Any]]] = {"50": [], "65": [], "80": [], "90": []}
         self._ref_gear_mtimes: Dict[str, float] = {}
+        self._peak_kernel = np.ones((5, 5), np.uint8)
+        self._max_workers = min(6, max(2, os.cpu_count() or 4))
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="gear_scan")
 
         self.load_reference_gear_library()
 
@@ -524,6 +528,123 @@ class GearDetector:
     # ---------------------------------------------------------
     # Inventory Scanning (3-Stage Decoupled Engine)
     # ---------------------------------------------------------
+    def _scan_pass(
+        self,
+        search_lib: List[Dict[str, Any]],
+        tmpl_key: str,
+        gray_key: str,
+        roi_img: np.ndarray,
+        roi_gray: np.ndarray,
+        roi_h: int,
+        roi_w: int,
+        conf_threshold: float,
+        badge_w: int,
+        badge_h: int,
+        max_bw: int,
+        max_bh: int,
+        badge_thresh: float,
+        multi_corner_enabled: bool,
+        corner_size: int,
+        lock_tmpl_gray: Optional[np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        """Executes a single template-matching and verification pass across search_lib."""
+        effective_bw = min(badge_w, max_bw)
+        effective_bh = min(badge_h, max_bh)
+
+        def process_chunk(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            chunk_cands = []
+            for ref in refs:
+                tmpl = ref[tmpl_key]
+                tmpl_gray = ref.get(gray_key)
+                if tmpl_gray is None:
+                    tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY) if len(tmpl.shape) == 3 else tmpl
+                th, tw = tmpl.shape[:2]
+                if th > roi_h or tw > roi_w:
+                    continue
+
+                res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                dilated = cv2.dilate(res, self._peak_kernel, borderType=cv2.BORDER_REPLICATE)
+                loc = np.where((res >= conf_threshold) & (res == dilated))
+                for pt in zip(*loc[::-1]):
+                    px, py = int(pt[0]), int(pt[1])
+                    score = float(res[py, px])
+
+                    # Skip items clipped by top or bottom ROI boundary
+                    if py < -4 or (py + th) > roi_h + 4:
+                        continue
+
+                    crop_y1 = max(0, py)
+                    crop_y2 = min(roi_h, py + th)
+                    crop_x1 = max(0, px)
+                    crop_x2 = min(roi_w, px + tw)
+                    slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
+                    tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
+
+                    # 1. Immortal Guard
+                    r_detected = self.classify_slot_border_rarity(slot_crop)
+                    if r_detected == "Immortal":
+                        continue
+
+                    # 2. Color Fidelity
+                    diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
+                    if diff > 30.0:
+                        continue
+
+                    # Optional Switchable 3-Corner Rarity Check
+                    corner_info = None
+                    if multi_corner_enabled:
+                        corner_info = self.classify_multi_corner_rarity(slot_crop, corner_size=corner_size)
+                        if corner_info.get("rarity") == "Immortal":
+                            continue
+                        if corner_info.get("confidence", 0.0) >= 0.85 and corner_info.get("rarity") != ref["rarity"]:
+                            continue
+
+                    # 3. Corner Level Badge Verification
+                    ch, cw = slot_crop.shape[:2]
+                    lv_score = 1.0
+                    if ch >= effective_bh and cw >= effective_bw:
+                        c_slot = slot_crop[max(0, ch - effective_bh):ch, max(0, cw - effective_bw):cw]
+                        c_tmpl = tmpl_crop[max(0, ch - effective_bh):ch, max(0, cw - effective_bw):cw]
+                        if c_slot.shape == c_tmpl.shape:
+                            corner_match = float(cv2.matchTemplate(c_slot, c_tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
+                            lv_score = max(0.0, corner_match)
+                            if corner_match < badge_thresh:
+                                continue
+
+                        ref_lv = str(ref.get("level", ""))
+                        if ref_lv in ("50", "65", "80", "90"):
+                            det_lv, _ = self.detect_slot_level(slot_crop, expected_lv=ref_lv)
+                            if det_lv is not None and det_lv != ref_lv:
+                                continue
+                            # Common gear cross-bracket collision guard:
+                            # Common items share identical base sprites across brackets (50, 65, 80, 90).
+                            # When matching against a Common Lv. 50 template, the slot must be positively confirmed as Lv. 50.
+                            if ref_lv == "50" and ref.get("rarity") == "Common" and det_lv != "50":
+                                continue
+
+                    # Lock Check (uses cached grayscale template)
+                    if lock_tmpl_gray is not None:
+                        if self.matcher.find_template(slot_crop, lock_tmpl_gray, threshold=0.75, grayscale=True):
+                            continue
+
+                    chunk_cands.append({
+                        "x": px, "y": py, "w": tw, "h": th,
+                        "score": score, "lv_score": lv_score,
+                        "ref": ref,
+                        "corner_info": corner_info
+                    })
+            return chunk_cands
+
+        if len(search_lib) >= 16 and self._max_workers > 1:
+            chunk_size = max(1, (len(search_lib) + self._max_workers - 1) // self._max_workers)
+            chunks = [search_lib[i:i + chunk_size] for i in range(0, len(search_lib), chunk_size)]
+            raw_candidates = []
+            for chunk_cands in self._executor.map(process_chunk, chunks):
+                raw_candidates.extend(chunk_cands)
+            return raw_candidates
+
+        return process_chunk(search_lib)
+
     def scan_visible_inventory(
         self,
         inventory_roi: Optional[Dict[str, int]] = None,
@@ -572,167 +693,28 @@ class GearDetector:
         multi_corner_enabled = bool(self.config.get("multi_corner_rarity_enabled", False))
         corner_size = max(4, int(self.config.get("corner_detector_size", 10)))
 
-        raw_candidates = []
+        # Pre-load shared templates once on caller thread before parallel scanning
+        self._get_digit_templates()
+        lock_tmpl_gray = self.matcher.load_template("lock_icon.png", grayscale=True)
+
         roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY) if len(roi_img.shape) == 3 else roi_img
 
         # Pass 1: Standard 0.8x scaled templates (100% DPI game scale)
-        for ref in search_lib:
-            tmpl = ref["tmpl_08"]
-            tmpl_gray = ref.get("tmpl_08_gray")
-            if tmpl_gray is None:
-                tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY) if len(tmpl.shape) == 3 else tmpl
-            th, tw = tmpl.shape[:2]
-            if th > roi_h or tw > roi_w:
-                continue
-
-            res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-            loc = np.where(res >= conf_threshold)
-            for pt in zip(*loc[::-1]):
-                px, py = pt[0], pt[1]
-                score = float(res[py, px])
-
-                # Skip items clipped by top or bottom ROI boundary
-                if py < -4 or (py + th) > roi_h + 4:
-                    continue
-
-                crop_y1 = max(0, py)
-                crop_y2 = min(roi_h, py + th)
-                crop_x1 = max(0, px)
-                crop_x2 = min(roi_w, px + tw)
-                slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
-                tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
-
-                # 1. Immortal Guard
-                r_detected = self.classify_slot_border_rarity(slot_crop)
-                if r_detected == "Immortal":
-                    continue
-
-                # 2. Color Fidelity
-                diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
-                if diff > 30.0:
-                    continue
-
-                # Optional Switchable 3-Corner Rarity Check
-                corner_info = None
-                if multi_corner_enabled:
-                    corner_info = self.classify_multi_corner_rarity(slot_crop, corner_size=corner_size)
-                    if corner_info.get("rarity") == "Immortal":
-                        continue
-                    if corner_info.get("confidence", 0.0) >= 0.85 and corner_info.get("rarity") != ref["rarity"]:
-                        continue
-
-                # 3. Corner Level Badge Verification
-                ch, cw = slot_crop.shape[:2]
-                lv_score = 1.0
-                effective_bw = min(badge_w, 20)
-                effective_bh = min(badge_h, 16)
-                if ch >= effective_bh and cw >= effective_bw:
-                    c_slot = slot_crop[max(0, ch - effective_bh):ch, max(0, cw - effective_bw):cw]
-                    c_tmpl = tmpl_crop[max(0, ch - effective_bh):ch, max(0, cw - effective_bw):cw]
-                    if c_slot.shape == c_tmpl.shape:
-                        corner_match = float(cv2.matchTemplate(c_slot, c_tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
-                        lv_score = max(0.0, corner_match)
-                        if corner_match < badge_thresh:
-                            continue
-
-                    ref_lv = str(ref.get("level", ""))
-                    if ref_lv in ("50", "65", "80", "90"):
-                        det_lv, _ = self.detect_slot_level(slot_crop, expected_lv=ref_lv)
-                        if det_lv is not None and det_lv != ref_lv:
-                            continue
-                        # Common gear cross-bracket collision guard:
-                        # Common items share identical base sprites across brackets (50, 65, 80, 90).
-                        # When matching against a Common Lv. 50 template, the slot must be positively confirmed as Lv. 50.
-                        if ref_lv == "50" and ref.get("rarity") == "Common" and det_lv != "50":
-                            continue
-
-                # Lock Check
-                if self.matcher.template_exists("lock_icon.png"):
-                    if self.matcher.find_template(slot_crop, "lock_icon.png", threshold=0.75):
-                        continue
-
-                raw_candidates.append({
-                    "x": px, "y": py, "w": tw, "h": th,
-                    "score": score, "lv_score": lv_score,
-                    "ref": ref,
-                    "corner_info": corner_info
-                })
+        raw_candidates = self._scan_pass(
+            search_lib, "tmpl_08", "tmpl_08_gray",
+            roi_img, roi_gray, roi_h, roi_w,
+            conf_threshold, badge_w, badge_h, 20, 16,
+            badge_thresh, multi_corner_enabled, corner_size, lock_tmpl_gray
+        )
 
         # Pass 2: Fallback to 1.0x raw templates if no matches found (125% DPI scale)
         if not raw_candidates:
-            for ref in search_lib:
-                tmpl = ref["tmpl_raw"]
-                tmpl_gray = ref.get("tmpl_raw_gray")
-                if tmpl_gray is None:
-                    tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY) if len(tmpl.shape) == 3 else tmpl
-                th, tw = tmpl.shape[:2]
-                if th > roi_h or tw > roi_w:
-                    continue
-
-                res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-                loc = np.where(res >= conf_threshold)
-                for pt in zip(*loc[::-1]):
-                    px, py = pt[0], pt[1]
-                    score = float(res[py, px])
-
-                    if py < -4 or (py + th) > roi_h + 4:
-                        continue
-
-                    crop_y1 = max(0, py)
-                    crop_y2 = min(roi_h, py + th)
-                    crop_x1 = max(0, px)
-                    crop_x2 = min(roi_w, px + tw)
-                    slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
-                    tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
-
-                    r_detected = self.classify_slot_border_rarity(slot_crop)
-                    if r_detected == "Immortal":
-                        continue
-
-                    diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
-                    if diff > 30.0:
-                        continue
-
-                    corner_info = None
-                    if multi_corner_enabled:
-                        corner_info = self.classify_multi_corner_rarity(slot_crop, corner_size=corner_size)
-                        if corner_info.get("rarity") == "Immortal":
-                            continue
-                        if corner_info.get("confidence", 0.0) >= 0.85 and corner_info.get("rarity") != ref["rarity"]:
-                            continue
-
-                    ch, cw = slot_crop.shape[:2]
-                    lv_score = 1.0
-                    effective_bw = min(badge_w, 24)
-                    effective_bh = min(badge_h, 20)
-                    if ch >= effective_bh and cw >= effective_bw:
-                        c_slot = slot_crop[max(0, ch - effective_bh):ch, max(0, cw - effective_bw):cw]
-                        c_tmpl = tmpl_crop[max(0, ch - effective_bh):ch, max(0, cw - effective_bw):cw]
-                        if c_slot.shape == c_tmpl.shape:
-                            corner_match = float(cv2.matchTemplate(c_slot, c_tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
-                            lv_score = max(0.0, corner_match)
-                            if corner_match < badge_thresh:
-                                continue
-
-                        ref_lv = str(ref.get("level", ""))
-                        if ref_lv in ("50", "65", "80", "90"):
-                            det_lv, _ = self.detect_slot_level(slot_crop, expected_lv=ref_lv)
-                            if det_lv is not None and det_lv != ref_lv:
-                                continue
-                            # Common gear cross-bracket collision guard:
-                            if ref_lv == "50" and ref.get("rarity") == "Common" and det_lv != "50":
-                                continue
-
-                    if self.matcher.template_exists("lock_icon.png"):
-                        if self.matcher.find_template(slot_crop, "lock_icon.png", threshold=0.75):
-                            continue
-
-                    raw_candidates.append({
-                        "x": px, "y": py, "w": tw, "h": th,
-                        "score": score, "lv_score": lv_score,
-                        "ref": ref,
-                        "corner_info": corner_info
-                    })
+            raw_candidates = self._scan_pass(
+                search_lib, "tmpl_raw", "tmpl_raw_gray",
+                roi_img, roi_gray, roi_h, roi_w,
+                conf_threshold, badge_w, badge_h, 24, 20,
+                badge_thresh, multi_corner_enabled, corner_size, lock_tmpl_gray
+            )
 
         if not raw_candidates:
             return []

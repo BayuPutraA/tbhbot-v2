@@ -4,6 +4,7 @@ Manages the SS_materials/ reference library (42 material types across Uncommon, 
 and detects visible materials in inventory slots for automatic stashing.
 """
 import os
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from typing import Optional, List, Dict, Any, Tuple
@@ -33,6 +34,9 @@ class MaterialDetector:
             "Immortal": []
         }
         self._mat_mtimes: Dict[str, float] = {}
+        self._peak_kernel = np.ones((5, 5), np.uint8)
+        self._max_workers = min(6, max(2, os.cpu_count() or 4))
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="mat_scan")
 
         self.load_material_library()
 
@@ -344,6 +348,82 @@ class MaterialDetector:
     # ---------------------------------------------------------
     # Inventory Material Scanning
     # ---------------------------------------------------------
+    def _scan_pass(
+        self,
+        roi_img: np.ndarray,
+        roi_gray: np.ndarray,
+        roi_h: int,
+        roi_w: int,
+        conf_threshold: float,
+        tmpl_key: str,
+        gray_key: str,
+        prof_key: str,
+    ) -> List[Dict[str, Any]]:
+        """Executes a single template-matching and color/rarity verification pass for materials."""
+        def process_chunk(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            chunk_cands = []
+            for ref in refs:
+                tmpl = ref[tmpl_key]
+                tmpl_gray = ref.get(gray_key)
+                if tmpl_gray is None:
+                    tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY) if len(tmpl.shape) == 3 else tmpl
+                th, tw = tmpl.shape[:2]
+                if th > roi_h or tw > roi_w:
+                    continue
+
+                res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                dilated = cv2.dilate(res, self._peak_kernel, borderType=cv2.BORDER_REPLICATE)
+                loc = np.where((res >= conf_threshold) & (res == dilated))
+                for pt in zip(*loc[::-1]):
+                    px, py = int(pt[0]), int(pt[1])
+                    score = float(res[py, px])
+
+                    # Skip clipped edge items
+                    if py < -4 or (py + th) > roi_h + 4:
+                        continue
+
+                    crop_y1 = max(0, py)
+                    crop_y2 = min(roi_h, py + th)
+                    crop_x1 = max(0, px)
+                    crop_x2 = min(roi_w, px + tw)
+                    slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
+                    tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
+
+                    # Color Fidelity
+                    diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
+                    if diff > 38.0:
+                        continue
+
+                    # Strict Anti-Recolor Color Verification
+                    color_prof = ref.get(prof_key)
+                    if color_prof is not None:
+                        c_score, _, _ = self.verify_color_similarity(slot_crop, color_prof)
+                        if c_score < 0.65:
+                            continue
+
+                    # Rarity Border Verification
+                    rarity_res = self.classify_slot_rarity(slot_crop)
+                    det_rarity = rarity_res.get("rarity", "Common")
+                    if rarity_res.get("confidence", 0.0) >= 0.65 and det_rarity != ref["rarity"]:
+                        continue
+
+                    chunk_cands.append({
+                        "x": px, "y": py, "w": tw, "h": th,
+                        "score": score,
+                        "ref": ref
+                    })
+            return chunk_cands
+
+        if len(self._mat_library) >= 12 and self._max_workers > 1:
+            chunk_size = max(1, (len(self._mat_library) + self._max_workers - 1) // self._max_workers)
+            chunks = [self._mat_library[i:i + chunk_size] for i in range(0, len(self._mat_library), chunk_size)]
+            raw_candidates = []
+            for chunk_cands in self._executor.map(process_chunk, chunks):
+                raw_candidates.extend(chunk_cands)
+            return raw_candidates
+
+        return process_chunk(self._mat_library)
+
     def scan_visible_materials(
         self,
         inventory_roi: Optional[Dict[str, int]] = None,
@@ -374,108 +454,20 @@ class MaterialDetector:
             return []
 
         conf_threshold = threshold if threshold is not None else float(self.config.get("confidence_threshold", 0.72))
-        raw_candidates = []
         roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY) if len(roi_img.shape) == 3 else roi_img
 
         # Pass 1: Standard 0.8x scaled templates
-        for ref in self._mat_library:
-            tmpl = ref["tmpl_08"]
-            tmpl_gray = ref.get("tmpl_08_gray")
-            if tmpl_gray is None:
-                tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY) if len(tmpl.shape) == 3 else tmpl
-            th, tw = tmpl.shape[:2]
-            if th > roi_h or tw > roi_w:
-                continue
-
-            res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-            loc = np.where(res >= conf_threshold)
-            for pt in zip(*loc[::-1]):
-                px, py = pt[0], pt[1]
-                score = float(res[py, px])
-
-                # Skip clipped edge items
-                if py < -4 or (py + th) > roi_h + 4:
-                    continue
-
-                crop_y1 = max(0, py)
-                crop_y2 = min(roi_h, py + th)
-                crop_x1 = max(0, px)
-                crop_x2 = min(roi_w, px + tw)
-                slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
-                tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
-
-                # Color Fidelity
-                diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
-                if diff > 38.0:
-                    continue
-
-                # Strict Anti-Recolor Color Verification
-                color_prof = ref.get("color_prof_08")
-                if color_prof is not None:
-                    c_score, _, _ = self.verify_color_similarity(slot_crop, color_prof)
-                    if c_score < 0.65:
-                        continue
-
-                # Rarity Border Verification
-                rarity_res = self.classify_slot_rarity(slot_crop)
-                det_rarity = rarity_res.get("rarity", "Common")
-                if rarity_res.get("confidence", 0.0) >= 0.65 and det_rarity != ref["rarity"]:
-                    continue
-
-                raw_candidates.append({
-                    "x": px, "y": py, "w": tw, "h": th,
-                    "score": score,
-                    "ref": ref
-                })
+        raw_candidates = self._scan_pass(
+            roi_img, roi_gray, roi_h, roi_w, conf_threshold,
+            "tmpl_08", "tmpl_08_gray", "color_prof_08"
+        )
 
         # Pass 2: Fallback to 1.0x raw templates if no matches found
         if not raw_candidates:
-            for ref in self._mat_library:
-                tmpl = ref["tmpl_raw"]
-                tmpl_gray = ref.get("tmpl_raw_gray")
-                if tmpl_gray is None:
-                    tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY) if len(tmpl.shape) == 3 else tmpl
-                th, tw = tmpl.shape[:2]
-                if th > roi_h or tw > roi_w:
-                    continue
-
-                res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-                loc = np.where(res >= conf_threshold)
-                for pt in zip(*loc[::-1]):
-                    px, py = pt[0], pt[1]
-                    score = float(res[py, px])
-
-                    if py < -4 or (py + th) > roi_h + 4:
-                        continue
-
-                    crop_y1 = max(0, py)
-                    crop_y2 = min(roi_h, py + th)
-                    crop_x1 = max(0, px)
-                    crop_x2 = min(roi_w, px + tw)
-                    slot_crop = roi_img[crop_y1:crop_y2, crop_x1:crop_x2]
-                    tmpl_crop = tmpl[:crop_y2 - crop_y1, :crop_x2 - crop_x1]
-
-                    diff = float(np.mean(cv2.absdiff(slot_crop, tmpl_crop)))
-                    if diff > 38.0:
-                        continue
-
-                    # Strict Anti-Recolor Color Verification
-                    color_prof = ref.get("color_prof_raw")
-                    if color_prof is not None:
-                        c_score, _, _ = self.verify_color_similarity(slot_crop, color_prof)
-                        if c_score < 0.65:
-                            continue
-
-                    rarity_res = self.classify_slot_rarity(slot_crop)
-                    det_rarity = rarity_res.get("rarity", "Common")
-                    if rarity_res.get("confidence", 0.0) >= 0.65 and det_rarity != ref["rarity"]:
-                        continue
-
-                    raw_candidates.append({
-                        "x": px, "y": py, "w": tw, "h": th,
-                        "score": score,
-                        "ref": ref
-                    })
+            raw_candidates = self._scan_pass(
+                roi_img, roi_gray, roi_h, roi_w, conf_threshold,
+                "tmpl_raw", "tmpl_raw_gray", "color_prof_raw"
+            )
 
         # Spatial Non-Maximum Suppression (deduplicate overlapping hits within 18px)
         raw_candidates.sort(key=lambda c: c["score"], reverse=True)

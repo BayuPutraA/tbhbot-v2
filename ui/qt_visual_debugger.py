@@ -11,11 +11,53 @@ import cv2
 import numpy as np
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap, QFont
 
 from vision import VisionEngine
 from .qt_theme import DARK_THEME_QSS
+
+
+class _OverlayRenderThread(QThread):
+    """Background worker thread for non-blocking screen capture & vision overlay rendering."""
+    finished_render = Signal(object, object, str)
+
+    def __init__(
+        self,
+        vision: VisionEngine,
+        inv_roi: Optional[Dict[str, int]],
+        chest_roi: Optional[Dict[str, int]],
+        mode: str,
+        show_gears: bool,
+        show_materials: bool,
+        show_corrosion: bool,
+        show_lvl50: bool,
+        parent: Optional[QtCore.QObject] = None,
+    ):
+        super().__init__(parent)
+        self.vision = vision
+        self.inv_roi = inv_roi
+        self.chest_roi = chest_roi
+        self.mode = mode
+        self.show_gears = show_gears
+        self.show_materials = show_materials
+        self.show_corrosion = show_corrosion
+        self.show_lvl50 = show_lvl50
+
+    def run(self):
+        try:
+            annotated_bgr, stats = self.vision.render_debug_overlay(
+                inv_roi=self.inv_roi,
+                chest_roi=self.chest_roi,
+                mode=self.mode,
+                show_gears=self.show_gears,
+                show_materials=self.show_materials,
+                show_corrosion=self.show_corrosion,
+                show_lvl50=self.show_lvl50,
+            )
+            self.finished_render.emit(annotated_bgr, stats, "")
+        except Exception as e:
+            self.finished_render.emit(None, None, str(e))
 
 
 class QtVisualDebugger(QtWidgets.QMainWindow):
@@ -37,6 +79,10 @@ class QtVisualDebugger(QtWidgets.QMainWindow):
         self.vision = vision_engine
         self.config_data = config_data or {}
         self.current_mode = "full"
+        self._render_thread: Optional[_OverlayRenderThread] = None
+        self._render_in_flight = False
+        self._pending_refresh = False
+        self._closing = False
 
         # Auto-refresh timer
         self.auto_timer = QTimer(self)
@@ -230,68 +276,104 @@ class QtVisualDebugger(QtWidgets.QMainWindow):
         self.refresh_view()
 
     def refresh_view(self):
-        if not self.vision:
+        if not self.vision or self._closing:
             return
 
-        inv_roi = self.vision.get_inventory_roi()
+        if self._render_in_flight:
+            self._pending_refresh = True
+            return
+
+        self._render_in_flight = True
+        self._pending_refresh = False
+
+        inv_roi = self.config_data.get("rois", {}).get("inventory_roi") or self.config_data.get("rois", {}).get("inventory_grid")
+        if not (inv_roi and inv_roi.get("width", 0) > 40 and inv_roi.get("height", 0) > 40):
+            inv_roi = None
         chest_roi = self.config_data.get("rois", {}).get("chest_region")
 
-        try:
-            annotated_bgr, stats = self.vision.render_debug_overlay(
-                inv_roi=inv_roi,
-                chest_roi=chest_roi,
-                mode=self.current_mode,
-                show_gears=getattr(self, "cb_show_gears", None) is None or self.cb_show_gears.isChecked(),
-                show_materials=getattr(self, "cb_show_mats", None) is None or self.cb_show_mats.isChecked(),
-                show_corrosion=getattr(self, "cb_show_corr", None) is None or self.cb_show_corr.isChecked(),
-                show_lvl50=getattr(self, "cb_show_lvl50", None) is None or self.cb_show_lvl50.isChecked()
-            )
-            self.raw_bgr = annotated_bgr
+        show_gears = getattr(self, "cb_show_gears", None) is None or self.cb_show_gears.isChecked()
+        show_materials = getattr(self, "cb_show_mats", None) is None or self.cb_show_mats.isChecked()
+        show_corrosion = getattr(self, "cb_show_corr", None) is None or self.cb_show_corr.isChecked()
+        show_lvl50 = getattr(self, "cb_show_lvl50", None) is None or self.cb_show_lvl50.isChecked()
 
-            # Compose informative status message
-            total = stats.get("total_items", 0)
-            t65 = stats.get("tier_65", 0)
-            t80 = stats.get("tier_80_90", 0)
-            rc = stats.get("rarity_counts", {})
-            chest_st = stats.get("chest_status", "UNKNOWN")
-            mats = stats.get("materials", [])
-            corrs = stats.get("corrosion_items", [])
+        thread = _OverlayRenderThread(
+            vision=self.vision,
+            inv_roi=inv_roi,
+            chest_roi=chest_roi,
+            mode=self.current_mode,
+            show_gears=show_gears,
+            show_materials=show_materials,
+            show_corrosion=show_corrosion,
+            show_lvl50=show_lvl50,
+            parent=self,
+        )
+        self._render_thread = thread
+        thread.finished_render.connect(self._on_render_finished)
+        thread.start()
 
-            if self.current_mode == "materials":
-                mat_names = ", ".join(f"{m.get('name')}({int(m.get('score', 0)*100)}%)" for m in mats[:5])
-                msg = f"Mode: MATERIALS | Found {len(mats)} material(s): {mat_names if mat_names else 'None'}"
-            elif self.current_mode == "corrosion":
-                corr_names = ", ".join(f"{c.get('name')}({int(c.get('score', 0)*100)}%)" for c in corrs[:5])
-                msg = f"Mode: CORROSION | Found {len(corrs)} corrosion item(s): {corr_names if corr_names else 'None'}"
-            elif self.current_mode == "lvl50":
-                lvl50_list = stats.get("lvl50_items", [])
-                lvl50_names = ", ".join(f"{it.get('name')}[{it.get('rarity')}](conf:{int(it.get('score', 0)*100)}%)" for it in lvl50_list[:5])
-                msg = f"Mode: LV. 50 | Found {len(lvl50_list)} Lv. 50 item(s): {lvl50_names if lvl50_names else 'None'}"
-            else:
-                lvl50_cnt = len(stats.get("lvl50_items", []))
-                msg = (
-                    f"Mode: {self.current_mode.upper()} | Gears: {total} (Lv.65: {t65}, Lv.80~90: {t80}) | "
-                    f"Mats: {len(mats)} | Corr: {len(corrs)} | Lv.50: {lvl50_cnt} | "
-                    f"Rarity: [L:{rc.get('Legendary', 0)}, R:{rc.get('Rare', 0)}, U:{rc.get('Uncommon', 0)}, C:{rc.get('Common', 0)}] | "
-                    f"Chest: {chest_st}"
-                )
-            self.status_bar_lbl.setText(msg)
+    def _on_render_finished(self, annotated_bgr: Any, stats: Any, error_msg: str):
+        if self._render_thread is not None:
+            self._render_thread.wait(500)
+            self._render_thread.deleteLater()
+            self._render_thread = None
 
-            # Convert to QPixmap and display
-            annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-            h, w, ch = annotated_rgb.shape
-            q_img = QImage(annotated_rgb.data, w, h, ch * w, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_img)
+        self._render_in_flight = False
+        if self._closing:
+            return
 
-            # Scale to fit image_label preserving aspect ratio
-            lbl_size = self.image_label.size()
-            if lbl_size.width() > 10 and lbl_size.height() > 10:
-                scaled = pixmap.scaled(lbl_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.image_label.setPixmap(scaled)
-            else:
-                self.image_label.setPixmap(pixmap)
-        except Exception as e:
-            self.status_bar_lbl.setText(f"Capture/Render Error: {e}")
+        if error_msg or annotated_bgr is None or stats is None:
+            self.status_bar_lbl.setText(f"Capture/Render Error: {error_msg or 'Unknown error'}")
+        else:
+            try:
+                self.raw_bgr = annotated_bgr
+
+                # Compose informative status message
+                total = stats.get("total_items", 0)
+                t65 = stats.get("tier_65", 0)
+                t80 = stats.get("tier_80_90", 0)
+                rc = stats.get("rarity_counts", {})
+                chest_st = stats.get("chest_status", "UNKNOWN")
+                mats = stats.get("materials", [])
+                corrs = stats.get("corrosion_items", [])
+
+                if self.current_mode == "materials":
+                    mat_names = ", ".join(f"{m.get('name')}({int(m.get('score', 0)*100)}%)" for m in mats[:5])
+                    msg = f"Mode: MATERIALS | Found {len(mats)} material(s): {mat_names if mat_names else 'None'}"
+                elif self.current_mode == "corrosion":
+                    corr_names = ", ".join(f"{c.get('name')}({int(c.get('score', 0)*100)}%)" for c in corrs[:5])
+                    msg = f"Mode: CORROSION | Found {len(corrs)} corrosion item(s): {corr_names if corr_names else 'None'}"
+                elif self.current_mode == "lvl50":
+                    lvl50_list = stats.get("lvl50_items", [])
+                    lvl50_names = ", ".join(f"{it.get('name')}[{it.get('rarity')}](conf:{int(it.get('score', 0)*100)}%)" for it in lvl50_list[:5])
+                    msg = f"Mode: LV. 50 | Found {len(lvl50_list)} Lv. 50 item(s): {lvl50_names if lvl50_names else 'None'}"
+                else:
+                    lvl50_cnt = len(stats.get("lvl50_items", []))
+                    msg = (
+                        f"Mode: {self.current_mode.upper()} | Gears: {total} (Lv.65: {t65}, Lv.80~90: {t80}) | "
+                        f"Mats: {len(mats)} | Corr: {len(corrs)} | Lv.50: {lvl50_cnt} | "
+                        f"Rarity: [L:{rc.get('Legendary', 0)}, R:{rc.get('Rare', 0)}, U:{rc.get('Uncommon', 0)}, C:{rc.get('Common', 0)}] | "
+                        f"Chest: {chest_st}"
+                    )
+                self.status_bar_lbl.setText(msg)
+
+                # Convert to QPixmap and display (copy QImage to decouple from NumPy buffer)
+                annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                h, w, ch = annotated_rgb.shape
+                q_img = QImage(annotated_rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+                pixmap = QPixmap.fromImage(q_img)
+
+                lbl_size = self.image_label.size()
+                if lbl_size.width() > 10 and lbl_size.height() > 10:
+                    scaled = pixmap.scaled(lbl_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self.image_label.setPixmap(scaled)
+                else:
+                    self.image_label.setPixmap(pixmap)
+            except Exception as e:
+                self.status_bar_lbl.setText(f"Capture/Render Error: {e}")
+
+        if self._pending_refresh and not self._closing:
+            self._pending_refresh = False
+            QTimer.singleShot(0, self.refresh_view)
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
         super().resizeEvent(event)
@@ -309,5 +391,9 @@ class QtVisualDebugger(QtWidgets.QMainWindow):
                 pass
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        self._closing = True
+        self._pending_refresh = False
         self.auto_timer.stop()
+        if self._render_thread is not None and self._render_thread.isRunning():
+            self._render_thread.wait(1500)
         super().closeEvent(event)
